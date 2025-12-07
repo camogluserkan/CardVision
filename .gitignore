@@ -1,0 +1,13 @@
+# Python cache
+__pycache__/
+
+# Output directory
+output_lines/
+
+# Virtual environment (eğer kullanıyorsan)
+venv/
+*.venv/
+
+*.png
+*.jpg
+*.jpeg
