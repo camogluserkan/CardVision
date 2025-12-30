@@ -2,7 +2,9 @@
 __pycache__/
 
 # Output directory
+test_outputs/
 output_lines/
+output_gui/
 
 # Virtual environment (eğer kullanıyorsan)
 venv/

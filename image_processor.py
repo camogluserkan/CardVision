@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
 import os
+import pytesseract # OSD için gerekli
+import re          # Regex ile açı değerini çekmek için
 
 # -----------------------------------------------------------------------------
 # PART I: PERSPECTIVE CORRECTION
@@ -30,6 +32,50 @@ def order_points(pts):
     # Return the sorted coordinates
     return rect
 
+def fix_orientation(image):
+    """
+    Resmin yönünü bulmak için 'Deneme-Yanılma' yöntemini kullanır.
+    Resmi 0, 90, 180, 270 derece açılarda tarar.
+    'TURKIYE', 'REPUBLIC' gibi anahtar kelimeleri okuyabildiği açıyı doğru kabul eder.
+    """
+    
+    # Kimlik kartında kesinlikle olması gereken kelimeler
+    keywords = ["TURKIYE", "CUMHURIYETI", "REPUBLIC", "TURKEY", "IDENTITY", "KART", "SOYADI"]
+    
+    print("   [Smart-Rotate] Doğru açı aranıyor...")
+
+    # Orijinal resmi bozmamak için kopyala
+    current_img = image.copy()
+    
+    # Maksimum 4 tur (0, 90, 180, 270 derece)
+    for angle in [0, 90, 180, 270]:
+        try:
+            # Hızlı OCR taraması (PSM 11: Sparse Text - Hızlıdır)
+            # Sadece büyük harfleri ve boşlukları alarak hızlandırıyoruz
+            ocr_data = pytesseract.image_to_string(current_img, config='--psm 11').upper()
+            
+            # Anahtar kelimelerden HERHANGİ BİRİ var mı?
+            for keyword in keywords:
+                if keyword in ocr_data:
+                    if angle == 0:
+                        print(f"      -> Yön zaten doğru (0°). İşlem yapılmadı.")
+                    else:
+                        print(f"      -> {angle}° çevrilince '{keyword}' okundu. Yön düzeltildi! ✅")
+                    return current_img
+
+            # Eğer kelime bulunamadıysa, bir sonraki tur için 90 derece çevir
+            # (Saat yönünde)
+            current_img = cv2.rotate(current_img, cv2.ROTATE_90_CLOCKWISE)
+            
+        except Exception as e:
+            print(f"      -> Hata oluştu: {e}")
+            continue
+
+    # Eğer 4 turda da hiçbir şey okunamazsa (Resim çok bulanıksa vs.)
+    # Yapacak bir şey yok, orijinali (veya en son hali) döndür.
+    print("   [Smart-Rotate] Uyarı: Hiçbir açıda anlamlı kelime okunamadı. Orijinal varsayılıyor.")
+    return image
+
 def normalize_id_card(image_path, output_dir="output_lines"):
     """
     Finds the ID card in an image, corrects its perspective,
@@ -54,9 +100,11 @@ def normalize_id_card(image_path, output_dir="output_lines"):
     
     # Resize the image for faster processing. 500px height is a good trade-off.
     # Keep the ratio to scale coordinates back later.
-    ratio = 1 # image.shape[0] / 500.0
-    image = orig #cv2.resize(image, (int(image.shape[1] / ratio), 500))
-    
+    target_height = 600.0
+    ratio = image.shape[0] / target_height
+    image = cv2.resize(image, (int(image.shape[1] / ratio), int(target_height)))
+
+
     # Save resized
     cv2.imwrite(os.path.join(output_dir, "norm_02_resized.png"), image)
 
@@ -71,111 +119,90 @@ def normalize_id_card(image_path, output_dir="output_lines"):
     # d=9: Piksel komşuluğu çapı.
     # sigmaColor=75: Renk uzayındaki filtre standart sapması (büyük değer = uzak renkler birbirine karışır).
     # sigmaSpace=75: Koordinat uzayındaki filtre standart sapması.
-    filtered = cv2.bilateralFilter(gray, 9, 75, 75)
-    cv2.imwrite(os.path.join(output_dir, "norm_04_bilateral.png"), filtered)
+    # Bilateral yerine GaussianBlur kullanıyoruz.
+    # (7, 7) kernel boyutu masadaki ince detayları (damarları) öldürür.
+    filtered = cv2.GaussianBlur(gray, (7, 7), 0)
+    cv2.imwrite(os.path.join(output_dir, "norm_04_gaussian.png"), filtered)
+
 
     screenCnt = None
     contours = []
 
-    # --- YÖNTEM 1: Parlaklık Tabanlı (Thresholding) ---
-    # "Kimlik beyazdır" varsayımı.
-    # Otsu thresholding ile otomatik olarak "Açık renkli ön plan" ve "Koyu arka plan" ayrımı yapıyoruz.
-    print("Trying Method 1: Thresholding (Whiteness detection)...")
-    ret, thresh = cv2.threshold(filtered, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # --- KENAR TESPİTİ (Canny) ---
+    # Arkadaşının kodundaki mantık: Önce kenarları bul, sonra birleştir.
     
-    # Check for failure case: Image is mostly white (background merged)
-    total_pixels = image.shape[0] * image.shape[1]
-    white_pixels = cv2.countNonZero(thresh)
-    white_ratio = white_pixels / total_pixels
+    # 1. Canny ile kenarları bul (30-150 arası iyi bir aralıktır)
+    edged = cv2.Canny(filtered, 30, 150)
     
-    if white_ratio > 0.80:
-        print(f"Warning: Thresholding result is too white ({white_ratio:.2f}). Background is likely light. Skipping Method 1.")
-        # Method 1 skipped, screenCnt remains None
-    else:
-        # Threshold sonucunda oluşan gürültüleri temizle (Opening/Closing)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        # Closing: Kartın içindeki delikleri (yazılar vb.) kapatır, bütün bir beyaz blok yapar.
-        thresh_cleaned = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel) 
-        # Opening: Kartın etrafındaki küçük beyaz gürültüleri siler.
-        thresh_cleaned = cv2.morphologyEx(thresh_cleaned, cv2.MORPH_OPEN, kernel) 
-        cv2.imwrite(os.path.join(output_dir, "norm_05_threshold.png"), thresh_cleaned)
+    # 2. Dilation (Genişletme): Kopuk çizgileri birleştirmek için kritik adım.
+    # Kartın kenarı ışık yüzünden kopuk görünüyorsa burası tamireder.
+    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    edged = cv2.dilate(edged, dilate_kernel, iterations=1)
+    
+    # ... Önceki kodlar aynı (Canny ve Dilation kısmı) ...
+    
+    cv2.imwrite(os.path.join(output_dir, "norm_05_canny_dilated.png"), edged)
 
-        # Kontur ara (Threshold üzerinden)
-        contours, _ = cv2.findContours(thresh_cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
+    # --- KONTUR BULMA ve FİLTRELEME (GÜNCELLENDİ) ---
+    contours, _ = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Arama derinliğini artır: İlk 10 kontura bak (Kart bazen 1. sırada çıkmayabilir)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
+
+    found_contour = False
+    screenCnt = None
+    
+    print(f"Toplam {len(contours)} aday kontur inceleniyor...")
+
+    for i, c in enumerate(contours):
+        # Çevre uzunluğu
+        peri = cv2.arcLength(c, True)
+        # Köşe sayısını azalt (Approximate)
+        # 0.02 bazen çok kaba kalabilir, 0.015 deneyelim daha hassas olsun
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
         
-        for c in contours:
-            area = cv2.contourArea(c)
-            # Alan kontrolü: %10'dan küçükse gürültü, %95'ten büyükse çerçeve/arka plan
-            if area < (total_pixels * 0.10) or area > (total_pixels * 0.95):
-                continue
+        # Bounding Box al
+        (x, y, w_box, h_box) = cv2.boundingRect(approx)
+        aspect_ratio = w_box / float(h_box)
+        
+        # DEBUG: Görelim bakalım ne bulmuş da reddetmiş?
+        print(f"Kontur #{i}: Köşe={len(approx)}, Oran={aspect_ratio:.2f}, Alan={cv2.contourArea(c)}")
 
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-            if len(approx) == 4:
-                screenCnt = approx
-                print("ID card found using THRESHOLDING (Method 1).")
+        # --- KRİTİK DÜZELTME ---
+        # Sadece 4 ve üzeri köşe olması yeterli.
+        # Aspect Ratio aralığını GENİŞLETİYORUZ. 
+        # Çünkü kart yamuksa bounding box kare olur (oran 1.0'a yaklaşır).
+        # 0.8 ile 2.5 arası diyerek neredeyse her türlü dikdörtgeni kabul edelim.
+        if len(approx) >= 4:
+            if 0.8 < aspect_ratio < 2.5: # Aralığı genişlettik!
+                # EĞER TAM 4 KÖŞE DEĞİLSE (Örn: 8 köşe), DİKDÖRTGENE ZORLA
+                if len(approx) == 4:
+                    # Zaten 4 köşe ise direkt al, sorun yok.
+                    screenCnt = approx
+                else:
+                    # Köşeler yuvarlatılmışsa (8, 10 köşe vs.),
+                    # Şekli içine alan en küçük dönük dikdörtgeni (Rotated Rect) bul.
+                    rect = cv2.minAreaRect(c)
+                    box = cv2.boxPoints(rect)
+                    
+                    # approx formatına uydurmak için reshape yapıyoruz: (4, 1, 2)
+                    screenCnt = np.int32(box).reshape(-1, 1, 2)
+
+                found_contour = True
+                print(f"--> KABUL EDİLDİ! (Oran: {aspect_ratio:.2f}, Final Köşe: 4)")
                 break
 
-    # --- YÖNTEM 2: Kenar Tabanlı (Keskinleştirme + Morfolojik Gradyan + Opening/Closing) ---
-    # Eğer Threshold yöntemi başarısız olursa, sert geçişleri bulup gürültüyü temizliyoruz.
-    if screenCnt is None:
-        print("Method 1 failed or skipped. Trying Method 2: Sharpening + Morph Gradient + Open/Close...")
-        
-        # 1. CLAHE ile kontrastı artır
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(filtered)
-        
-        # 2. Keskinleştirme (Sharpening)
-        # Kenarları daha belirgin hale getirir.
-        sharpen_kernel = np.array([[-1, -1, -1],
-                                   [-1,  9, -1],
-                                   [-1, -1, -1]])
-        enhanced = cv2.filter2D(enhanced, -1, sharpen_kernel)
-        cv2.imwrite(os.path.join(output_dir, "norm_04_sharpened_m2.png"), enhanced)
-        
-        # 3. Canny Kenar Tespiti + Dilation (Genişletme)
-        # Önceki "Gradient + Open/Close" yöntemi görüntüyü bozduğu için,
-        # daha temiz çizgiler üreten Canny algoritmasına geçiyoruz.
-        # "enhanced" (güçlendirilmiş) görüntü üzerinde Canny çok daha iyi sonuç verir.
-        
-        # Canny: Kenarları ince çizgiler halinde bulur.
-        # 30 ve 150 eşik değerleri, hem zayıf hem güçlü kenarları yakalamak için seçildi.
-        edged = cv2.Canny(enhanced, 30, 150)
-        cv2.imwrite(os.path.join(output_dir, "norm_05_m2_canny.png"), edged)
-        
-        # Dilation: Canny'nin bulduğu çizgilerdeki ufak kopuklukları birleştirir.
-        # (3,3) boyutunda küçük bir kernel ile kenarları hafifçe kalınlaştırıp bağlıyoruz.
-        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        edged = cv2.dilate(edged, dilate_kernel, iterations=1)
-        cv2.imwrite(os.path.join(output_dir, "norm_05_m2_dilated.png"), edged)
-        
-        cv2.imwrite(os.path.join(output_dir, "norm_05_m2_processed.png"), edged)
+            else:
+                print("--> Reddedildi (Oran uyumsuz)")
+        else:
+             print("--> Reddedildi (Köşe sayısı yetersiz)")
 
-        # --- Find the Card Contour ---
-        contours, _ = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
-        
-        for c in contours:
-            area = cv2.contourArea(c)
-            if area < (total_pixels * 0.10) or area > (total_pixels * 0.95):
-                continue
+    if not found_contour:
+        print("Uygun formatta kimlik kartı konturu bulunamadı.")
+        # Fallback (Acil Durum): Eğer hiçbiri uymazsa, en büyük 4 köşeli olanı almayı deneyebilirsin.
+        # Şimdilik None dönüyor.
+        return None
 
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-            
-            if len(approx) == 4:
-                screenCnt = approx
-                print("ID card contour found using Method 2 (Sharpen+Gradient+Open/Close).")
-                break
-    
-    # If still None (no contours found at all), fail
-    if screenCnt is None:
-        print("Error: No suitable contour found.")
-        return None    # Debug: Draw the selected contour
-    debug_selected = image.copy()
-    cv2.drawContours(debug_selected, [screenCnt], -1, (0, 0, 255), 3)
-    cv2.imwrite(os.path.join(output_dir, "norm_07_selected_contour.png"), debug_selected)
+    # ... Buradan sonrası (Perspective Transform) aynı kalacak ...
 
     # --- Apply Perspective Transform ---
     # Scale the contour points back to the original image size
@@ -206,6 +233,8 @@ def normalize_id_card(image_path, output_dir="output_lines"):
     # Apply the transform to the *original, unresized* image
     warped = cv2.warpPerspective(orig, M, (maxWidth, maxHeight))
     
+    warped = fix_orientation(warped)    
+    
     # Save final warped image
     cv2.imwrite(os.path.join(output_dir, "norm_08_warped.png"), warped)
     
@@ -218,115 +247,124 @@ def normalize_id_card(image_path, output_dir="output_lines"):
 # -----------------------------------------------------------------------------
 def segment_fields_from_blobs(normalized_image, output_dir):
     """
-    Segments the normalized ID card into individual fields of interest (like name, TC no, etc.)
-    using morphological operations and ROI masking.
+    Stabil Versiyon: Yatay Dilation (30, 1) kullanarak satırları birbirine
+    yapıştırmadan kelime gruplarını ayırır.
     """
-    print("Starting segmentation with precise photo masking...")
+    print("Segmentasyon (Yatay Ayrıştırma Modu) başlatılıyor...")
     
-    # --- Step 1: Binarization ---
-    # Convert the normalized color image to grayscale
+    h, w = normalized_image.shape[:2]
+    
+    # 1. Griye Çevir ve Threshold
     gray = cv2.cvtColor(normalized_image, cv2.COLOR_BGR2GRAY)
-    cv2.imwrite(os.path.join(output_dir, "seg_01_gray.png"), gray)
+    cv2.imwrite(os.path.join(output_dir, "seg_01_gray.png"), gray) # <--- KAYIT
 
-    # Invert the grayscale image (text becomes white, background becomes black)
-    # inverted_gray = cv2.bitwise_not(gray) # GEREK YOK
-    # cv2.imwrite(os.path.join(output_dir, "seg_02_inverted.png"), inverted_gray)
+    # 2. Adaptive Threshold (Arka plan desenlerini temizler)
+    binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                   cv2.THRESH_BINARY_INV, 19, 25)
+    cv2.imwrite(os.path.join(output_dir, "seg_02_binary.png"), binary) # <--- KAYIT
 
-    # Apply Adaptive Thresholding
-    # THRESH_BINARY_INV: Açık renk zemin -> Siyah, Koyu renk yazı -> Beyaz yapar.
-    # Bu sayede tam istediğimiz "Siyah zemin üzerinde Beyaz yazılar" görüntüsünü elde ederiz.
-    binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 10)
+    masked = binary.copy()
     
-    # Save the binary image for debugging
-    cv2.imwrite(os.path.join(output_dir, "seg_03_binary.png"), binary)
-
-    # --- Step 2: ROI Masking (Your Idea) ---
-    # This step blacks out non-text regions (photo, flag) *before* dilation
-    # to prevent them from merging with text blobs.
-    binary_masked = binary.copy()
-    height, width = binary_masked.shape[:2]
-
-    # Define coordinates for the Photo area (based on percentages)
-    # Fotoğraf maskesini biraz daralttık (0.35 -> 0.28) ki yanındaki yazıları (TC, Soyad) kapatmasın.
-    photo_x_start = int(width * 0.02) 
-    photo_x_end = int(width * 0.31)
-    photo_y_start = int(height * 0.35)
-    photo_y_end = int(height * 0.93) # Alt kısmı da biraz kıstık
-    # Draw a black rectangle over the photo area
-    cv2.rectangle(binary_masked, (photo_x_start, photo_y_start), (photo_x_end, photo_y_end), (0), thickness=cv2.FILLED)
+    # --- MASKELEME (Gürültü Bölgelerini Kapat) ---
+    # Bu maskeler veriye dokunmaz, sadece fotoğraf, bayrak ve başlığı siler.
     
-    # Define coordinates for the Flag (Ay-Yıldız) area (User's addition)
-    flag_x_start = int(width * 0.65) # Estimated start X
-    flag_x_end = int(width * 0.98)   # Estimated end X
-    flag_y_start = int(height * 0.17) # Estimated start Y
-    flag_y_end = int(height * 0.50)   # Estimated end Y
+    # A. Başlık Maskesi (Türkiye Cumhuriyeti yazısı) - %16
+    cv2.rectangle(masked, (0, 0), (w, int(h * 0.16)), (0), -1)
     
-    # Draw a black rectangle over the flag area
-    cv2.rectangle(binary_masked, (flag_x_start, flag_y_start), (flag_x_end, flag_y_end), (0), thickness=cv2.FILLED)
-
-    # Save the masked binary image for debugging
-    cv2.imwrite(os.path.join(output_dir, "seg_04_masked.png"), binary_masked)
+    # B. Fotoğraf Maskesi (Sol Taraf)
+    # TC'nin altından başlar (0.32), en alta kadar iner.
+    photo_x_end = int(w * 0.29)
+    photo_y_start = int(h * 0.32) 
+    cv2.rectangle(masked, (0, photo_y_start), (photo_x_end, h), (0), -1)
     
-    # --- Step 2.5: Salt-and-Pepper Noise Removal (Morphological Opening) ---
-    # Çok küçük beyaz noktaları (gürültü) temizlemek için "Opening" işlemi yapıyoruz.
-    # Opening = Erosion (Aşındırma) + Dilation (Genişletme)
-    # (2,2) boyutunda çok küçük bir kernel kullanıyoruz ki yazılar zarar görmesin.
-    noise_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    binary_masked = cv2.morphologyEx(binary_masked, cv2.MORPH_OPEN, noise_kernel)
-    cv2.imwrite(os.path.join(output_dir, "seg_04a_denoised.png"), binary_masked)
+    # C. Bayrak Maskesi (Sağ Taraf)
+    # Cinsiyet yazısına dokunmadan (0.60) biter.
+    flag_x_start = int(w * 0.66) 
+    flag_y_start = int(h * 0.15)
+    flag_y_end = int(h * 0.60)
+    cv2.rectangle(masked, (flag_x_start, flag_y_start), (w, flag_y_end), (0), -1)
 
-    # --- Step 2.6: Closing (Morphological Closing) ---
-    # Harflerin içindeki küçük siyah boşlukları veya kopuklukları birleştirmek için "Closing" yapıyoruz.
-    # Closing = Dilation (Genişletme) + Erosion (Aşındırma)
-    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    binary_masked = cv2.morphologyEx(binary_masked, cv2.MORPH_CLOSE, close_kernel)
-    cv2.imwrite(os.path.join(output_dir, "seg_04b_closed.png"), binary_masked)
+    cv2.imwrite(os.path.join(output_dir, "seg_03_masked.png"), masked) # <--- KAYIT
 
-    # --- Step 3: Dilation ---
-    # Create a rectangular kernel (15 wide, 3 high)
-    # This will connect letters into words, and nearby words into fields.
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
-    # Apply dilation to the *masked* image
-    dilated_words = cv2.dilate(binary_masked, kernel, iterations=2) 
-    # Save the dilated "blobs" image for debugging
-    cv2.imwrite(os.path.join(output_dir, "seg_05_dilated.png"), dilated_words)
-
-    # --- Step 4: Contour Extraction ---
-    # Find the contours of all the white blobs in the dilated image
-    contours, _ = cv2.findContours(dilated_words, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # --- MORFOLOJİ (KRİTİK DÜZELTME) ---
     
-    # Debug: Draw all contours
-    debug_contours = normalized_image.copy()
-    cv2.drawContours(debug_contours, contours, -1, (0, 0, 255), 1)
-    cv2.imwrite(os.path.join(output_dir, "seg_06_contours.png"), debug_contours)
+    # 1. Erosion: Çok ince gürültü noktalarını koparır
+    kernel_erode = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    eroded = cv2.erode(masked, kernel_erode, iterations=1)
+    cv2.imwrite(os.path.join(output_dir, "seg_04_eroded.png"), eroded) # <--- KAYIT
 
-    field_images = []
-    # Create a copy of the original normalized image to draw debug boxes on
-    output_with_boxes = normalized_image.copy()
+    # 2. Dilation: Harfleri birleştirir AMA satırları yapıştırmaz
+    # (30, 1) -> Yatayda çok bağla, Dikeyde hiç bağlama.
+    # Bu sayede "Soyadı" üst kutuda, "ATABEY" alt kutuda kalır.
+    kernel_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (30, 1)) 
+    dilated = cv2.dilate(eroded, kernel_dilate, iterations=2)
+    cv2.imwrite(os.path.join(output_dir, "seg_05_dilated.png"), dilated) # <--- KAYIT
+
+    # --- KONTUR BULMA ---
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    # Loop over every contour (blob) found
-    for contour in contours:
-        # Get the bounding box (x, y, width, height) of the blob
-        x, y, w, h = cv2.boundingRect(contour)
+    valid_boxes = []
+    
+    for c in contours:
+        x, y, bw, bh = cv2.boundingRect(c)
         
-        # --- Step 5: Filtering ---
-        # Filter out blobs that are too small (noise) or too large
-        if w > 30 and h > 15 and w < normalized_image.shape[1] * 0.8:
-            # Add a small padding around the box to ensure no text is cut off
-            padding = 5
-            start_y, start_x = max(0, y - padding), max(0, x - padding)
-            end_y, end_x = y + h + padding, x + w + padding
-            
-            # Crop the field from the *original normalized color image*
-            field_crop = normalized_image[start_y:end_y, start_x:end_x]
-            
-            if field_crop.size > 0:
-                # Add the cropped image to our list
-                field_images.append(field_crop)
-                # Draw a green box on the debug image
-                cv2.rectangle(output_with_boxes, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        # Filtreleme
+        if bw < 10 or bh < 8: continue # Çok küçük gürültü
+        if bw > w * 0.9: continue # Aşırı büyük hatalar
+        
+        # Oran Kontrolü (Dikey çizgi gürültülerini at)
+        aspect = bw / float(bh)
+        if aspect < 0.2: continue 
+
+        valid_boxes.append((x, y, bw, bh))
+
+    # --- AKILLI SIRALAMA (SATIR + SÜTUN) ---
+    # 1. Önce Y koordinatına göre kabaca sırala
+    valid_boxes.sort(key=lambda b: b[1])
     
-    # Save the final debug image with green boxes
-    cv2.imwrite(os.path.join(output_dir, "seg_07_final_boxes.png"), output_with_boxes)
-    # Return the list of cropped field images
+    sorted_boxes = []
+    if valid_boxes:
+        current_row = [valid_boxes[0]]
+        row_threshold = 10 # 10 piksel dikey yakınlık varsa aynı satır say
+        
+        for i in range(1, len(valid_boxes)):
+            prev_box = current_row[-1]
+            curr_box = valid_boxes[i]
+            
+            # Y koordinatları yakınsa aynı satıra ekle
+            if abs(curr_box[1] - prev_box[1]) < row_threshold:
+                current_row.append(curr_box)
+            else:
+                # Satır bitti, bu satırı X'e göre (Soldan Sağa) sırala
+                current_row.sort(key=lambda b: b[0])
+                sorted_boxes.extend(current_row)
+                current_row = [curr_box]
+        
+        # Son grubu ekle
+        current_row.sort(key=lambda b: b[0])
+        sorted_boxes.extend(current_row)
+    
+    # --- KESME VE DÖNDÜRME ---
+    field_images = []
+    debug_img = normalized_image.copy()
+    
+    for i, (x, y, bw, bh) in enumerate(sorted_boxes):
+        # ROI (Region of Interest) Kesme
+        # Padding eklemeden saf halini kesiyoruz (Padding'i main.py'de ekleyeceğiz)
+        roi = normalized_image[y:y+bh, x:x+bw]
+        
+        field_images.append(roi)
+        
+        # Görsel Debug
+        color = (0, 255, 0)
+        # Eğer yükseklik çok küçükse (Etiket olma ihtimali yüksek) rengi farklı yap
+        if bh < 18: color = (0, 255, 255) # Sarı (Muhtemel Etiket)
+        
+        cv2.rectangle(debug_img, (x, y), (x+bw, y+bh), color, 1)
+        # Sıra numarasını yaz
+        cv2.putText(debug_img, f"{i}", (x, y-2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
+
+    cv2.imwrite(os.path.join(output_dir, "seg_06_final_boxes.png"), debug_img) # <--- KAYIT
+    print(f"Segmentasyon tamamlandı. {len(field_images)} blok bulundu.")
+    
     return field_images
