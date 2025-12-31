@@ -132,7 +132,7 @@ class IDCardApp:
                 cv2.imwrite(os.path.join(self.output_dir, f"gui_field_{i}.png"), processed_img)
 
                 # Tesseract Ayarı
-                custom_config = r'--oem 3 --psm 7 -c tessedit_char_whitelist="ABCÇDEFGĞHIİJKLMNOÖPRSŞTUÜVYZ0123456789./- "'
+                custom_config = r'--oem 3 --psm 7 -c tessedit_char_whitelist=ABCÇDEFGĞHIİJKLMNOÖPRSŞTUÜVYZ0123456789./-'
                 text = pytesseract.image_to_string(processed_img, config=custom_config)
                 cleaned_text = text.replace('\n', ' ').strip()
 
