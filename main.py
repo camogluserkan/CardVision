@@ -24,7 +24,7 @@ def preprocess_for_ocr(img):
 # --- MAIN EXECUTION BLOCK ---
 if __name__ == "__main__":
     
-    INPUT_IMAGE_PATH = "kimlik.jpeg" 
+    INPUT_IMAGE_PATH = "sample_tc.jpeg" 
     OUTPUT_DIRECTORY = "output_lines" 
 
     if not os.path.exists(OUTPUT_DIRECTORY):
@@ -61,7 +61,8 @@ if __name__ == "__main__":
                 cv2.imwrite(output_path, processed_img)
                 
                 # 2. OCR Oku
-                custom_config = r'--oem 3 --psm 7 -c tessedit_char_whitelist="ABCÇDEFGĞHIİJKLMNOÖPRSŞTUÜVYZ0123456789./- "'
+                # Windows'ta shlex ayrıştırma hatası almamak için whitelist tırnaksız verildi
+                custom_config = r'--oem 3 --psm 7 -c tessedit_char_whitelist=ABCÇDEFGĞHIİJKLMNOÖPRSŞTUÜVYZ0123456789./-'
                 text = pytesseract.image_to_string(processed_img, config=custom_config)
                 
                 # Temizlik

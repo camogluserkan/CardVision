@@ -74,7 +74,7 @@ def run_batch_test():
                             processed_img = preprocess_for_ocr(field_img)
                             cv2.imwrite(os.path.join(current_output_dir, f"final_{i:02d}.png"), processed_img)
                             
-                            custom_config = r'--oem 3 --psm 7 -c tessedit_char_whitelist="ABCÇDEFGĞHIİJKLMNOÖPRSŞTUÜVYZ0123456789./- "'
+                            custom_config = r'--oem 3 --psm 7 -c tessedit_char_whitelist=ABCÇDEFGĞHIİJKLMNOÖPRSŞTUÜVYZ0123456789./-'
                             text = pytesseract.image_to_string(processed_img, config=custom_config)
                             cleaned_text = text.replace('\n', ' ').strip()
                             
